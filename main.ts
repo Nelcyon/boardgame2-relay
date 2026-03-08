@@ -1,8 +1,14 @@
 // Boardgame WebSocket Relay Server for Deno Deploy
-// Handles room creation, joining via room codes, and message relaying between 2 players.
+// Handles room creation, joining via room codes, and message relaying between up to 4 players.
 
+const MAX_PLAYERS = 4;
+
+// Room state: room code → array of sockets in the room
 const rooms = new Map<string, WebSocket[]>();
+// Socket → room code
 const socketToRoom = new Map<WebSocket, string>();
+// Socket → stable player number (1–4, never changes even if others disconnect)
+const socketToPlayer = new Map<WebSocket, number>();
 
 function generateRoomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars (0/O, 1/I)
@@ -11,6 +17,25 @@ function generateRoomCode(): string {
     code += chars[Math.floor(Math.random() * chars.length)];
   }
   return code;
+}
+
+function getPlayersInRoom(roomCode: string): number[] {
+  const sockets = rooms.get(roomCode);
+  if (!sockets) return [];
+  const nums: number[] = [];
+  for (const ws of sockets) {
+    const n = socketToPlayer.get(ws);
+    if (n !== undefined) nums.push(n);
+  }
+  return nums.sort((a, b) => a - b);
+}
+
+function nextAvailablePlayerNum(roomCode: string): number {
+  const taken = new Set(getPlayersInRoom(roomCode));
+  for (let i = 1; i <= MAX_PLAYERS; i++) {
+    if (!taken.has(i)) return i;
+  }
+  return 0; // room full
 }
 
 function broadcast(roomCode: string, message: string, exclude?: WebSocket) {
@@ -27,11 +52,12 @@ function removeFromRoom(ws: WebSocket) {
   const roomCode = socketToRoom.get(ws);
   if (!roomCode) return;
 
+  const playerNum = socketToPlayer.get(ws) ?? 0;
+
   const sockets = rooms.get(roomCode);
   if (sockets) {
     const idx = sockets.indexOf(ws);
-    const playerNum = idx + 1;
-    sockets.splice(idx, 1);
+    if (idx !== -1) sockets.splice(idx, 1);
 
     if (sockets.length === 0) {
       rooms.delete(roomCode);
@@ -39,10 +65,12 @@ function removeFromRoom(ws: WebSocket) {
       broadcast(roomCode, JSON.stringify({
         type: "player_disconnected",
         player: playerNum,
+        players: getPlayersInRoom(roomCode),
       }));
     }
   }
   socketToRoom.delete(ws);
+  socketToPlayer.delete(ws);
 }
 
 function handleWebSocket(ws: WebSocket, url: URL) {
@@ -57,11 +85,13 @@ function handleWebSocket(ws: WebSocket, url: URL) {
 
       rooms.set(code, [ws]);
       socketToRoom.set(ws, code);
+      socketToPlayer.set(ws, 1);
 
       ws.send(JSON.stringify({
         type: "room_created",
         room: code,
         player: 1,
+        players: [1],
       }));
 
     } else if (action === "join" && roomCode) {
@@ -73,26 +103,32 @@ function handleWebSocket(ws: WebSocket, url: URL) {
         ws.close();
         return;
       }
-      if (sockets.length >= 2) {
+      if (sockets.length >= MAX_PLAYERS) {
         ws.send(JSON.stringify({ type: "error", message: "Room is full" }));
         ws.close();
         return;
       }
 
+      const playerNum = nextAvailablePlayerNum(roomCode);
       sockets.push(ws);
       socketToRoom.set(ws, roomCode);
+      socketToPlayer.set(ws, playerNum);
 
-      // Notify joiner
+      const playerList = getPlayersInRoom(roomCode);
+
+      // Notify joiner with their number and who else is in the room
       ws.send(JSON.stringify({
         type: "room_joined",
         room: roomCode,
-        player: 2,
+        player: playerNum,
+        players: playerList,
       }));
 
-      // Notify host that player 2 joined
+      // Notify all existing players that someone new joined
       broadcast(roomCode, JSON.stringify({
         type: "player_joined",
-        player: 2,
+        player: playerNum,
+        players: playerList,
       }), ws);
 
     } else {
@@ -105,7 +141,7 @@ function handleWebSocket(ws: WebSocket, url: URL) {
     const room = socketToRoom.get(ws);
     if (!room) return;
 
-    // Relay message to the other player in the room
+    // Relay message to all other players in the room
     broadcast(room, event.data as string, ws);
   };
 
