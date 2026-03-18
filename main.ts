@@ -82,6 +82,7 @@ function handleWebSocket(ws: WebSocket, url: URL) {
   const roomCode = url.searchParams.get("room")?.toUpperCase();
 
   ws.onopen = () => {
+    socketLastActivity.set(ws, Date.now());
     if (action === "host") {
       // Create a new room
       let code = generateRoomCode();
