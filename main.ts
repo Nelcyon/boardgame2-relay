@@ -2,6 +2,8 @@
 // Handles room creation, joining via room codes, and message relaying between up to 4 players.
 
 const MAX_PLAYERS = 4;
+const HEARTBEAT_INTERVAL_MS = 20_000; // server pings clients every 20s
+const HEARTBEAT_TIMEOUT_MS = 60_000;  // consider dead after 60s of silence
 
 // Room state: room code → array of sockets in the room
 const rooms = new Map<string, WebSocket[]>();
@@ -9,6 +11,8 @@ const rooms = new Map<string, WebSocket[]>();
 const socketToRoom = new Map<WebSocket, string>();
 // Socket → stable player number (1–4, never changes even if others disconnect)
 const socketToPlayer = new Map<WebSocket, number>();
+// Socket → last activity timestamp (ms)
+const socketLastActivity = new Map<WebSocket, number>();
 
 function generateRoomCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars (0/O, 1/I)
@@ -138,16 +142,62 @@ function handleWebSocket(ws: WebSocket, url: URL) {
   };
 
   ws.onmessage = (event) => {
+    socketLastActivity.set(ws, Date.now());
     const room = socketToRoom.get(ws);
     if (!room) return;
+
+    // Handle heartbeat pings from client — respond with pong, don't relay
+    try {
+      const msg = JSON.parse(event.data as string);
+      if (msg && msg.type === "ping") {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong" }));
+        }
+        return;
+      }
+    } catch (_) {
+      // Not JSON — relay as-is
+    }
 
     // Relay message to all other players in the room
     broadcast(room, event.data as string, ws);
   };
 
-  ws.onclose = () => removeFromRoom(ws);
-  ws.onerror = () => removeFromRoom(ws);
+  ws.onclose = () => {
+    socketLastActivity.delete(ws);
+    removeFromRoom(ws);
+  };
+  ws.onerror = () => {
+    socketLastActivity.delete(ws);
+    removeFromRoom(ws);
+  };
 }
+
+// Server-side heartbeat: periodically ping all connected sockets and close dead ones
+setInterval(() => {
+  const now = Date.now();
+  for (const [ws, lastActive] of socketLastActivity) {
+    if (ws.readyState !== WebSocket.OPEN) {
+      socketLastActivity.delete(ws);
+      removeFromRoom(ws);
+      continue;
+    }
+    if (now - lastActive > HEARTBEAT_TIMEOUT_MS) {
+      console.log(`[Relay] Closing dead connection (player ${socketToPlayer.get(ws) ?? "?"}, silent for ${Math.round((now - lastActive) / 1000)}s)`);
+      socketLastActivity.delete(ws);
+      try { ws.close(4000, "heartbeat timeout"); } catch (_) { /* ignore */ }
+      removeFromRoom(ws);
+      continue;
+    }
+    // Send server-side ping to keep connection alive through proxies/NATs
+    try {
+      ws.send(JSON.stringify({ type: "heartbeat" }));
+    } catch (_) {
+      socketLastActivity.delete(ws);
+      removeFromRoom(ws);
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
 
 Deno.serve({ port: 8000 }, (req: Request) => {
   const url = new URL(req.url);
